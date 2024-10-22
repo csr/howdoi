@@ -32,14 +32,17 @@ from cachelib import FileSystemCache, NullCache
 
 from keep import utils as keep_utils
 
-from pygments import highlight
 from pygments.lexers import guess_lexer, get_lexer_by_name
-from pygments.formatters.terminal import TerminalFormatter
 from pygments.util import ClassNotFound
+from rich.syntax import Syntax
+from rich.console import Console
 
 from pyquery import PyQuery as pq
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import SSLError
+
+from colorama import init
+init()
 
 from howdoi import __version__
 from howdoi.errors import GoogleValidationError, BingValidationError, DDGValidationError
@@ -88,8 +91,10 @@ CACHE_DIR = appdirs.user_cache_dir('howdoi')
 CACHE_ENTRY_MAX = 128
 
 HTML_CACHE_PATH = 'page_cache'
-SUPPORTED_HELP_QUERIES = ['use howdoi', 'howdoi', 'run howdoi',
+SUPPORTED_HELP_QUERIES = ['use howdoi', 'howdoi', 'run howdoi', 'setup howdoi',
                           'do howdoi', 'howdoi howdoi', 'howdoi use howdoi']
+
+NO_RESULTS_MESSAGE = "Sorry, couldn't find any help with that topic"
 
 # variables for text formatting, prepend to string to begin text formatting.
 BOLD = '\033[1m'
@@ -103,6 +108,8 @@ STASH_SAVE = 'save'
 STASH_VIEW = 'view'
 STASH_REMOVE = 'remove'
 STASH_EMPTY = 'empty'
+
+BLOCKED_ENGINES = []
 
 if os.getenv('HOWDOI_DISABLE_CACHE'):
     # works like an always empty cache
@@ -161,28 +168,35 @@ def get_proxies():
     for key, value in proxies.items():
         if key.startswith('http'):
             if not value.startswith('http'):
-                filtered_proxies[key] = 'http://%s' % value
+                filtered_proxies[key] = f'http://{value}'
             else:
                 filtered_proxies[key] = value
     return filtered_proxies
-
-
-def _format_url_to_filename(url, file_ext='html'):
-    filename = ''.join(ch for ch in url if ch.isalnum())
-    return filename + '.' + file_ext
 
 
 def _get_result(url):
     try:
         resp = howdoi_session.get(url, headers={'User-Agent': _random_choice(USER_AGENTS)},
                                   proxies=get_proxies(),
-                                  verify=VERIFY_SSL_CERTIFICATE)
+                                  verify=VERIFY_SSL_CERTIFICATE,
+                                  cookies={'CONSENT': 'YES+US.en+20170717-00-0'})
         resp.raise_for_status()
         return resp.text
     except requests.exceptions.SSLError as error:
         logging.error('%sEncountered an SSL Error. Try using HTTP instead of '
                       'HTTPS by setting the environment variable "HOWDOI_DISABLE_SSL".\n%s', RED, END_FORMAT)
         raise error
+
+
+def _get_from_cache(cache_key):
+    # As of cachelib 0.3.0, it internally logging a warning on cache miss
+    current_log_level = logging.getLogger().getEffectiveLevel()
+    # Reduce the log level so the warning is not printed
+    logging.getLogger().setLevel(logging.ERROR)
+    page = cache.get(cache_key)  # pylint: disable=assignment-from-none
+    # Restore the log level
+    logging.getLogger().setLevel(current_log_level)
+    return page
 
 
 def _add_links_to_text(element):
@@ -225,7 +239,7 @@ def _clean_google_link(link):
 
 def _extract_links_from_google(query_object):
     html = query_object.html()
-    link_pattern = re.compile(r"https?://*stackoverflow.com/questions/[0-9]*/[a-z0-9-]*")
+    link_pattern = re.compile(fr"https?://{URL}/questions/[0-9]*/[a-z0-9-]*")
     links = link_pattern.findall(html)
     links = [_clean_google_link(link) for link in links]
     return links
@@ -273,10 +287,11 @@ def _get_links(query):
     try:
         result = _get_result(search_url)
     except requests.HTTPError:
+        logging.info('Received HTTPError')
         result = None
     if not result or _is_blocked(result):
         logging.error('%sUnable to find an answer because the search engine temporarily blocked the request. '
-                      'Please wait a few minutes or select a different search engine.%s', RED, END_FORMAT)
+                      'Attempting to use a different search engine.%s', RED, END_FORMAT)
         raise BlockError('Temporary block by search engine')
 
     html = pq(result)
@@ -302,12 +317,11 @@ def _format_output(args, code):
     if not args['color']:
         return code
     lexer = None
-
     # try to find a lexer using the StackOverflow tags
     # or the query arguments
     for keyword in args['query'].split() + args['tags']:
         try:
-            lexer = get_lexer_by_name(keyword)
+            lexer = get_lexer_by_name(keyword).name
             break
         except ClassNotFound:
             pass
@@ -315,13 +329,15 @@ def _format_output(args, code):
     # no lexer found above, use the guesser
     if not lexer:
         try:
-            lexer = guess_lexer(code)
+            lexer = guess_lexer(code).name
         except ClassNotFound:
             return code
 
-    return highlight(code,
-                     lexer,
-                     TerminalFormatter(bg='dark'))
+    syntax = Syntax(code, lexer, background_color="default", line_numbers=False)
+    console = Console(record=True)
+    with console.capture() as capture:
+        console.print(syntax)
+    return capture.get()
 
 
 def _is_question(link):
@@ -337,7 +353,7 @@ def _get_questions(links):
 
 def _get_answer(args, link):  # pylint: disable=too-many-branches
     cache_key = _get_cache_key(link)
-    page = cache.get(link)  # pylint: disable=assignment-from-none
+    page = _get_from_cache(cache_key)
     if not page:
         logging.info('Fetching page: %s', link)
         page = _get_result(link + '?answertab=votes')
@@ -384,7 +400,7 @@ def _get_answer(args, link):  # pylint: disable=too-many-branches
 
 def _get_links_with_cache(query):
     cache_key = _get_cache_key(query)
-    res = cache.get(cache_key)  # pylint: disable=assignment-from-none
+    res = _get_from_cache(cache_key)
     if res:
         logging.info('Using cached links')
         if res == CACHE_EMPTY_VAL:
@@ -418,11 +434,12 @@ def _get_answers(args):
         return False
 
     initial_pos = args['pos'] - 1
-    final_pos = initial_pos + args['num_answers']
+    final_pos = initial_pos + int(args['num_answers'])
     question_links = question_links[initial_pos:final_pos]
     search_engine = os.getenv('HOWDOI_SEARCH_ENGINE', 'google')
 
-    logging.info('%s links found on %s: %s', URL, search_engine, len(question_links))
+    logging.info('Links from %s found on %s: %s', URL, search_engine, len(question_links))
+    logging.info('URL: %s', '\n '.join(question_links))
     logging.info('Answers requested: %s, Starting at position: %s', args["num_answers"], args['pos'])
 
     with Pool() as pool:
@@ -431,11 +448,13 @@ def _get_answers(args):
             [(args, link) for link in question_links]
         )
 
-    for idx, _ in enumerate(answers):
-        answers[idx]['position'] = idx + 1
+    answers = [a for a in answers if a.get('answer')]
+    for i, answer in enumerate(answers, 1):
+        answer['position'] = i
 
     logging.info('Total answers returned: %s', len(answers))
-    return answers
+
+    return answers or False
 
 
 def _get_answer_worker(args, link):
@@ -446,7 +465,7 @@ def _get_answer_worker(args, link):
         'position': None
     }
 
-    multiple_answers = (args['num_answers'] > 1 or args['all'])
+    multiple_answers = (int(args['num_answers']) > 1 or args['all'])
 
     if not answer:
         return result
@@ -474,7 +493,7 @@ def _is_help_query(query):
 
 def _format_answers(args, res):
     if "error" in res:
-        return res["error"]
+        return f'ERROR: {RED}{res["error"]}{END_FORMAT}'
 
     if args["json_output"]:
         return json.dumps(res)
@@ -485,7 +504,7 @@ def _format_answers(args, res):
         next_ans = answer["answer"]
         if args["link"]:  # if we only want links
             next_ans = answer["link"]
-        formatted_answers.append(next_ans)
+        formatted_answers.append(next_ans or NO_RESULTS_MESSAGE)
 
     return build_splitter().join(formatted_answers)
 
@@ -587,7 +606,13 @@ def howdoi(raw_query):
     else:
         args = raw_query
 
-    os.environ['HOWDOI_SEARCH_ENGINE'] = args['search_engine']
+    search_engine = args['search_engine'] or os.getenv('HOWDOI_SEARCH_ENGINE') or 'google'
+    os.environ['HOWDOI_SEARCH_ENGINE'] = search_engine
+    if search_engine not in SUPPORTED_SEARCH_ENGINES:
+        supported_search_engines = ', '.join(SUPPORTED_SEARCH_ENGINES)
+        message = f'Unsupported engine {search_engine}. The supported engines are: {supported_search_engines}'
+        res = {'error': message}
+        return _parse_cmd(args, res)
 
     args['query'] = ' '.join(args['query']).replace('?', '')
     cache_key = _get_cache_key(args)
@@ -595,7 +620,7 @@ def howdoi(raw_query):
     if _is_help_query(args['query']):
         return _get_help_instructions() + '\n'
 
-    res = cache.get(cache_key)  # pylint: disable=assignment-from-none
+    res = _get_from_cache(cache_key)
 
     if res:
         logging.info('Using cached response (add -C to clear the cache)')
@@ -606,14 +631,23 @@ def howdoi(raw_query):
     try:
         res = _get_answers(args)
         if not res:
-            message = 'Sorry, couldn\'t find any help with that topic'
+            message = NO_RESULTS_MESSAGE
             if not args['explain']:
                 message = f'{message} (use --explain to learn why)'
             res = {'error': message}
         cache.set(cache_key, res)
     except (RequestsConnectionError, SSLError):
-        res = {'error': f'Unable to reach {args["search_engine"]}. Do you need to use a proxy?\n'}
-
+        res = {'error': f'Unable to reach {search_engine}. Do you need to use a proxy?\n'}
+    except BlockError:
+        BLOCKED_ENGINES.append(search_engine)
+        next_engine = next((engine for engine in SUPPORTED_SEARCH_ENGINES if engine not in BLOCKED_ENGINES), None)
+        if next_engine is None:
+            res = {'error': 'Unable to get a response from any search engine\n'}
+        else:
+            args['search_engine'] = next_engine
+            args['query'] = args['query'].split()
+            logging.info('%sRetrying search with %s%s', GREEN, next_engine, END_FORMAT)
+            return howdoi(args)
     return _parse_cmd(args, res)
 
 
@@ -643,10 +677,10 @@ def get_parser():
     parser.add_argument('-j', '--json', help='return answers in raw json format', dest='json_output',
                         action='store_true')
     parser.add_argument('--json-output', action='store_true', help=argparse.SUPPRESS)
-    parser.add_argument('-v', '--version', help='displays the current version of howdoi',
+    parser.add_argument('-v', '--version', help='display the current version of howdoi',
                         action='store_true')
     parser.add_argument('-e', '--engine', help='search engine for this query (google, bing, duckduckgo)',
-                        dest='search_engine', nargs="?", default='google', metavar='ENGINE')
+                        dest='search_engine', nargs="?", metavar='ENGINE')
     parser.add_argument('--save', '--stash', help='stash a howdoi answer',
                         action='store_true')
     parser.add_argument('--view', help='view your stash',
@@ -717,8 +751,8 @@ def perform_sanity_check():
     cache = NullCache()
 
     exit_code = 0
-    for engine in ('google', 'bing', 'duckduckgo'):
-        print('Checking {}...'.format(engine))
+    for engine in ['google']:  # 'bing' and 'duckduckgo' throw various block errors
+        print(f'Checking {engine}...')
         try:
             _sanity_check(engine)
         except (GoogleValidationError, BingValidationError, DDGValidationError):
@@ -777,16 +811,16 @@ def command_line_runner():  # pylint: disable=too-many-return-statements,too-man
     if os.getenv('HOWDOI_COLORIZE'):
         args['color'] = True
 
-    if not args['search_engine'] in SUPPORTED_SEARCH_ENGINES:
-        logging.error('Unsupported engine.\nThe supported engines are: %s' ', '.join(SUPPORTED_SEARCH_ENGINES))
-        return
+    howdoi_result = howdoi(args)
 
-    utf8_result = howdoi(args).encode('utf-8', 'ignore')
-    if sys.version < '3':
-        print(utf8_result)
+    if os.name == 'nt':
+        # Windows
+        print(howdoi_result)
     else:
+        utf8_result = howdoi_result.encode('utf-8', 'ignore')
         # Write UTF-8 to stdout: https://stackoverflow.com/a/3603160
         sys.stdout.buffer.write(utf8_result)
+
     # close the session to release connection
     howdoi_session.close()
 

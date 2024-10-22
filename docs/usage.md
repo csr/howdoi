@@ -1,18 +1,19 @@
-## Usage
+Let's start at the beginning.
 
-If it's your first time using howdoi, run the quick help
-
-```bash
+```
 $ howdoi howdoi
 ```
 
+For further information about flags and environment variables:
 
-Print the help manual
-```bash
-$ howdoi # "howdoi -h" also prints help
+```
+$ howdoi -h
+```
 
-usage: howdoi.py [-h] [-p POS] [-n NUM] [-a] [-l] [-c] [-C] [-j] [-v] [-e [ENGINE]]
-                 [--save] [--view] [--remove] [--empty] [QUERY ...]
+#### Howdoi Flags and Arguments
+
+```
+usage: howdoi [-h] [-p POS] [-n NUM] [-a] [-l] [-c] [-x] [-C] [-j] [-v] [-e [ENGINE]] [--save] [--view] [--remove] [--empty] [QUERY ...]
 
 instant coding answers via the command line
 
@@ -26,9 +27,10 @@ optional arguments:
   -a, --all             display the full text of the answer
   -l, --link            display only the answer link
   -c, --color           enable colorized output
+  -x, --explain         explain how answer was chosen
   -C, --clear-cache     clear the cache
   -j, --json            return answers in raw json format
-  -v, --version         displays the current version of howdoi
+  -v, --version         display the current version of howdoi
   -e [ENGINE], --engine [ENGINE]
                         search engine for this query (google, bing, duckduckgo)
   --save, --stash       stash a howdoi answer

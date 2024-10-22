@@ -1,3 +1,28 @@
+2.0.20
+------
+-  Update dependency versions
+-  Add support for Python 3.10
+
+2.0.19
+------
+-  Fix typo
+
+2.0.18
+------
+-  Fixed issue with howdoi cache where cache misses would be printed to the console
+
+2.0.17
+------
+-  New documentation and mkdocs
+-  Fixed issue with how howdoi chooses the proper search engine (command line flags now override environment variables)
+-  Added a search engine fallback if one of the search engines fails
+-  Fixed issue with howdoi cache
+
+2.0.16
+------
+-  Fix GDPR issue for those using howdoi in countries outside the US
+-  Better support for using `HOWDOI_URL`
+
 2.0.15
 ------
 -  Add explainability with `-x` or `--explain` options
